@@ -1,0 +1,62 @@
+# Prometheus alert rules - human oversight (Art. 14 EU AI Act).
+#
+# Metrics come from the OTel Collector's spanmetrics connector (see otel-collector-config.yml).
+# Labels follow the usual OTel-attribute-dot to Prometheus-label-underscore convention
+# (human_oversight.tool_sequence_anomaly -> human_oversight_tool_sequence_anomaly). Boolean
+# signals are strings ("true"/"false"), not real booleans - Prometheus label matching is always
+# string matching.
+#
+# Signals are set by LangChain4jController#tagHumanOversightSignals on the root span of
+# /lc4j/order-status.
+
+groups:
+  - name: human-oversight
+    rules:
+
+      # tool_sequence_anomaly is deterministic (expected-vs-actual sequence comparison, no
+      # ML/estimation) - every occurrence is already the relevant event itself, not noise that
+      # needs confirming over a time window first. That's why there's NO for-delay here and no
+      # rate threshold like > 0.1 - a single deviating tool sequence is, under Art. 14, already
+      # reportable on its own.
+      - alert: UnexpectedToolSequenceDetected
+        expr: |
+          sum(increase(traces_span_metrics_calls_total{human_oversight_tool_sequence_anomaly="true"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          domain: human-oversight
+        annotations:
+          summary: "Agent executed tools in an unexpected order"
+          description: |
+            {{ $value }} trace(s) in the last 5 minutes with
+            human_oversight.tool_sequence_anomaly=true.
+            Expected sequence: lookup_order -> get_tracking_status.
+            The needs_review attribute is also true on these traces - see the review queue
+            (review-queue/review-queue.jsonl) for the exact trace IDs, then check the detail in
+            Jaeger.
+
+      # IMPORTANT on what this actually measures: this is NOT a real gauge on queue DEPTH -
+      # there's no endpoint/metric for "completed" reviews to subtract from the incoming flags.
+      # The alert only measures "over the last 30 minutes, at least one new needs_review=true
+      # trace arrived per interval, continuously" - i.e. sustained INFLOW, not a provably growing
+      # BACKLOG. A real depth metric would need a second counter built from completed
+      # human_intervention spans, deliberately not built here (correlating by trace ID doesn't
+      # map cleanly onto PromQL/spanmetrics - that would need an evaluation over the review queue
+      # file itself instead, see test-human-oversight.sh).
+      - alert: HumanReviewQueueGrowing
+        expr: |
+          sum(rate(traces_span_metrics_calls_total{human_oversight_needs_review="true"}[30m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+          domain: human-oversight
+        annotations:
+          summary: "Sustained inflow into the human review queue"
+          description: |
+            Traces with human_oversight.needs_review=true have been arriving continuously for at
+            least 30 minutes (tool-sequence anomaly, uncertainty markers or missing status words
+            in the answer, fallback after too many tool calls, or flagged by the end user
+            themselves - all deterministic, no LLM judge). This is NOT proof of a growing backlog
+            depth (see comment above) - but a sign that someone should look at the queue:
+            review-queue/review-queue.jsonl, then submit traceId/spanId from there to
+            POST /lc4j/human-intervention.

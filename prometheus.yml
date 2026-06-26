@@ -1,0 +1,27 @@
+global:
+  evaluation_interval: 15s
+
+rule_files:
+  - "/etc/prometheus/rules/human-oversight.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  # spanmetrics exported by the OTel Collector's connector (see otel-collector-config.yml) -
+  # this is where traces_span_metrics_calls_total, the metric both human-oversight alerts query,
+  # comes from.
+  - job_name: otel-collector-spanmetrics
+    scrape_interval: 10s
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  # The collector's own internal metrics (e.g. receiver/exporter health) - not used by any
+  # human-oversight alert, kept for general collector health visibility.
+  - job_name: otel-collector-internal
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["otel-collector:8888"]

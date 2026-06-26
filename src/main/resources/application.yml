@@ -1,0 +1,14 @@
+spring:
+  application:
+    name: otel-langchain4j-demo
+  autoconfigure:
+    exclude:
+      - dev.langchain4j.anthropic.spring.AutoConfig  # the model is wired manually in LangChain4jConfig, see below
+
+management:
+  tracing:
+    sampling:
+      probability: 1.0   # 100% - every request gets traced (dev only!)
+  otlp:
+    tracing:
+      endpoint: http://localhost:4318/v1/traces

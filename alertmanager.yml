@@ -1,0 +1,49 @@
+# Alertmanager configuration.
+#
+# Receives alerts from Prometheus and routes them. For local development: alerts only go to the
+# log (no email/Slack).
+#
+# In production this would instead have something like:
+#   receivers:
+#     - name: 'team-slack'
+#       slack_configs:
+#         - api_url: '${SLACK_WEBHOOK_URL}'
+#           channel: '#ai-alerts'
+#           text: '{{ .CommonAnnotations.description }}'
+#
+# UI: http://localhost:9093
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: 'local-log'
+  group_by: ['alertname', 'domain']
+  group_wait: 10s
+  group_interval: 5m
+  repeat_interval: 1h
+
+  routes:
+    - match:
+        severity: critical
+      receiver: 'local-log'
+      group_wait: 0s
+
+    # Human Oversight (Art. 14 EU AI Act): its own route instead of just falling under the
+    # default receiver. Locally this still ends up in the same 'local-log' receiver as everything
+    # else, BUT conceptually UnexpectedToolSequenceDetected and HumanReviewQueueGrowing aren't an
+    # infra/ops signal, they're a compliance/business signal - in a real production environment
+    # this would point at a dedicated receiver (e.g. a legal/compliance mailbox or a dedicated
+    # review Slack channel), not the general ops channel. group_wait deliberately lower than the
+    # global default (10s): for UnexpectedToolSequenceDetected (for: 0m in the rules), grouping
+    # shouldn't add extra delay to the first notification.
+    - match:
+        domain: human-oversight
+      receiver: 'local-log'
+      group_wait: 5s
+
+receivers:
+  # Logging only - fine for local development. Alerts are visible in the Alertmanager UI:
+  # http://localhost:9093
+  - name: 'local-log'
+    webhook_configs: []

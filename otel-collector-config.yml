@@ -1,0 +1,132 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # PII masking. Acts on whatever gets exported/telemetered - the actual prompt sent to Anthropic
+  # bypasses this entirely, because the API call happens before any span is exported. This demo
+  # has no PiiTokenizer-style pre-call layer (that's a later problem, not this one) - masking here
+  # is the ONLY PII safeguard in this repo, and it only ever touches what's already been sent to
+  # the model and is now being exported as telemetry.
+  #
+  # Note: these patterns stay in German-market format (DE.../+49... for IBAN/phone) even though
+  # the rest of this repo is English - the underlying learning project this is extracted from is a
+  # German-market demo, and the regexes are a literal, unmodified port.
+  transform/mask-pii:
+    error_mode: ignore
+    trace_statements:
+      # Context "spanevent": the attribute key on gen_ai.* events is "content".
+      - context: spanevent
+        statements:
+          - replace_pattern(attributes["content"], "[\\w._%+\\-]+@[\\w.\\-]+\\.[A-Za-z]{2,}", "[email]")
+          - replace_pattern(attributes["content"], "\\b(\\+49|0049|0)[\\s\\-/]?\\d[\\d\\s\\-/]{6,14}\\b", "[phone]")
+          - replace_pattern(attributes["content"], "\\bDE\\d{2}[\\s]?[\\d\\s]{18,}\\b", "[iban]")
+          - replace_pattern(attributes["content"], "\\b\\d{4}[\\s\\-]?\\d{4}[\\s\\-]?\\d{4}[\\s\\-]?\\d{4}\\b", "[card]")
+      # human_oversight.comment (set by HumanOversightController) and human_oversight.user_comment
+      # (the "userComment" request parameter on /lc4j/order-status) sit directly on a span
+      # attribute, not on a gen_ai.* event - hence context "span" here instead of "spanevent".
+      - context: span
+        statements:
+          - replace_pattern(attributes["human_oversight.comment"], "[\\w._%+\\-]+@[\\w.\\-]+\\.[A-Za-z]{2,}", "[email]")
+          - replace_pattern(attributes["human_oversight.comment"], "\\b(\\+49|0049|0)[\\s\\-/]?\\d[\\d\\s\\-/]{6,14}\\b", "[phone]")
+          - replace_pattern(attributes["human_oversight.comment"], "\\bDE\\d{2}[\\s]?[\\d\\s]{18,}\\b", "[iban]")
+          - replace_pattern(attributes["human_oversight.comment"], "\\b\\d{4}[\\s\\-]?\\d{4}[\\s\\-]?\\d{4}[\\s\\-]?\\d{4}\\b", "[card]")
+          - replace_pattern(attributes["human_oversight.user_comment"], "[\\w._%+\\-]+@[\\w.\\-]+\\.[A-Za-z]{2,}", "[email]")
+          - replace_pattern(attributes["human_oversight.user_comment"], "\\b(\\+49|0049|0)[\\s\\-/]?\\d[\\d\\s\\-/]{6,14}\\b", "[phone]")
+          - replace_pattern(attributes["human_oversight.user_comment"], "\\bDE\\d{2}[\\s]?[\\d\\s]{18,}\\b", "[iban]")
+          - replace_pattern(attributes["human_oversight.user_comment"], "\\b\\d{4}[\\s\\-]?\\d{4}[\\s\\-]?\\d{4}[\\s\\-]?\\d{4}\\b", "[card]")
+
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+
+  # Keeps only spans flagged human_oversight.needs_review=true for the file/review-queue
+  # exporter. OTTL filter processors use DROP semantics, so KEEPING needs_review=true requires
+  # negating the condition: drop everything where needs_review is NOT true.
+  filter/needs-review:
+    error_mode: ignore
+    traces:
+      span:
+        - attributes["human_oversight.needs_review"] != true
+
+connectors:
+  # Metric name: traces_span_metrics_calls_total - both human-oversight alerts in
+  # prometheus-rules.yml query this metric.
+  #
+  # dimensions: OTel attributes become Prometheus labels, dot notation
+  # (gen_ai.operation.name) -> underscore (gen_ai_operation_name).
+  spanmetrics:
+    histogram:
+      explicit:
+        buckets: [100ms, 250ms, 500ms, 1s, 2s, 5s, 10s]
+    dimensions:
+      - name: gen_ai.operation.name
+        default: unknown
+      - name: gen_ai.system
+        default: unknown
+      - name: gen_ai.request.model
+        default: unknown
+      # Makes the human-oversight signals from LangChain4jController#tagHumanOversightSignals
+      # queryable as Prometheus labels (see prometheus-rules.yml). default "false" because these
+      # attributes are only set on the root span of /lc4j/order-status - every other span would
+      # otherwise get no value and inflate label cardinality with an empty label.
+      - name: human_oversight.needs_review
+        default: "false"
+      - name: human_oversight.tool_sequence_anomaly
+        default: "false"
+    metrics_expiration: 5m
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+  # Spans flagged for human review, one JSON line per span - the file a reviewer (or
+  # HumanOversightController's curl example) pulls traceId/spanId from. Deliberately not a new
+  # piece of infrastructure (no queue/DB): the flagged spans already land fully (unfiltered) in
+  # Jaeger too - this file is only a lightweight pointer ("this traceId needs a look"), not a
+  # replacement for the trace view itself. format: json + rotation set explicitly, so this stays
+  # human-readable (newline-delimited JSON) with bounded growth instead of an unbounded file.
+  file/review-queue:
+    path: /var/log/otel/review-queue.jsonl
+    format: json
+    rotation:
+      max_megabytes: 10
+      max_days: 30
+      max_backups: 5
+
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [transform/mask-pii, batch]
+      exporters: [otlp/jaeger, spanmetrics, debug]
+
+    traces/review-queue:
+      receivers: [otlp]
+      processors: [transform/mask-pii, filter/needs-review, batch]
+      exporters: [file/review-queue]
+
+    metrics:
+      receivers: [spanmetrics]
+      exporters: [prometheus]
+
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
