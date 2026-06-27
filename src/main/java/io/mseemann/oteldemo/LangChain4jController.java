@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.anthropic.AnthropicChatModel;
@@ -28,10 +29,15 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Agentic tool chain for a shipping-status lookup, with five deterministic Human Oversight
- * signals (Art. 14 EU AI Act) layered on top - and nothing else.
+ * Agentic tool chain for a shipping-status lookup, with six Human Oversight signals (Art. 14 EU
+ * AI Act) layered on top - and nothing else. Five of them are purely deterministic; the sixth
+ * (judgeConfidence()) is a second model call that scores the first answer's confidence - itself
+ * just another AI system with the same uncertainties as the one it's judging, included anyway as
+ * an additional, parallel signal rather than as a replacement for the deterministic ones.
  *
  * Flow:
  * [HTTP GET /lc4j/order-status]
@@ -39,7 +45,8 @@ import java.util.Map;
  *   |- [execute_tool lookup_order]          <- tool span, returns a tracking ID
  *   |- [chat claude-haiku-...]             <- planning: needs get_tracking_status (using the ID from step 1)
  *   |- [execute_tool get_tracking_status]   <- tool span
- *   `- [chat claude-haiku-...]             <- final answer
+ *   |- [chat claude-haiku-...]             <- final answer
+ *   `- [chat claude-haiku-...]             <- judge: scores the final answer (success path only)
  *
  * The model decides on its own how many tool calls it needs (a generic loop, not a fixed step
  * sequence) - tool 2 isn't fed by the original user input but by the OUTPUT of tool 1, a
@@ -49,10 +56,12 @@ import java.util.Map;
  * is whatever the model writes - response.aiMessage().text(), verbatim, unfiltered. There is no
  * Java template standing between the model and the customer, no output guard, no PII tokenizer
  * on the way in, no second classification step deciding what kind of request this even is. The
- * five tagHumanOversightSignals() attributes below give a reviewer excellent visibility into
- * WHETHER something went wrong - they do nothing to PREVENT a wrong answer from reaching the
- * customer in the first place. Observability and containment are two different problems; this
- * endpoint solves only the first one. See the README for what that gap means in practice.
+ * judge call changes none of that - it never touches the returned answer, it only adds a span
+ * attribute. The six tagHumanOversightSignals() attributes below give a reviewer excellent
+ * visibility into WHETHER something went wrong - they do nothing to PREVENT a wrong answer from
+ * reaching the customer in the first place. Observability and containment are two different
+ * problems; this endpoint solves only the first one. See the README for what that gap means in
+ * practice.
  */
 @RestController
 @RequestMapping("/lc4j")
@@ -62,15 +71,23 @@ public class LangChain4jController {
     private static final int MAX_TOOL_STEPS = 4;
 
     // -----------------------------------------------------------------------
-    // Human Oversight (Art. 14): signals on /lc4j/order-status.
+    // Human Oversight (Art. 14): six signals on /lc4j/order-status.
     //
-    // Deliberately NO LLM judge (an earlier version of this class had a second chatModel call
-    // that scored the first answer) - a model scoring its own answer is itself just another AI
-    // system with the same uncertainties, and chat completions don't expose a native
-    // confidence/logprob signal anyway. All three text-based signals below are purely
-    // deterministic: a fixed expected-vs-actual comparison, or a fixed word list visible directly
-    // in the code - no model call, no learning, and any reviewer can see exactly WHY an answer
-    // was flagged.
+    // Five of them are purely deterministic: a fixed expected-vs-actual comparison, or a fixed
+    // word list visible directly in the code - no model call, no learning, and any reviewer can
+    // see exactly WHY an answer was flagged. The sixth, judgeConfidence(), is a second chatModel
+    // call that scores the first answer's confidence - itself just another AI system with the
+    // same uncertainties as the one it's judging, and chat completions don't expose a native
+    // confidence/logprob signal, so this is a second free-text call, parsed back into a number.
+    // An earlier version of this class rejected exactly this approach for exactly that reason.
+    // It's included here anyway, but as an ADDITIONAL signal running in parallel to the
+    // deterministic ones, not as a replacement: the word lists are cheap, reproducible, and
+    // explainable, but structurally blind to a confidently wrong answer that happens to use all
+    // the right status vocabulary ("Your order was delivered on 2026-06-21" - no hedging, all the
+    // right words, still possibly wrong). The judge can catch exactly that case; the word lists
+    // can't. Whoever only wants the cheap, deterministic signal can ignore
+    // judge_low_confidence/judge_failed; whoever wants the deeper, costlier check has it right
+    // next to it.
     //
     // CANONICAL_TOOL_SEQUENCE: the only tool order that's actually correct for this task -
     // get_tracking_status needs the tracking ID that only lookup_order produces, so that's also
@@ -81,6 +98,15 @@ public class LangChain4jController {
     // "distribution center" instead of naming it literally would be wrongly flagged as
     // incomplete) - that's accepted here, because a missed real failure case (a false negative)
     // is the much more expensive problem for Human Oversight.
+    //
+    // CONFIDENCE_REVIEW_THRESHOLD: deliberately conservative, not empirically derived from real
+    // traffic (there is none here) - a number to start tuning from, not a calibrated cutoff.
+    // judgeConfidence() only runs in the success path (see tagHumanOversightSignals): a fallback
+    // answer is a fixed string, scoring its "confidence" wouldn't mean anything. If the judge call
+    // itself fails (timeout, malformed reply), that's fail-OPEN for the customer (the original
+    // answer is returned regardless, the judge result never touches that path) but fail-CLOSED
+    // for the review flag (judgeFailed=true also sets needsReview=true - an unavailable second
+    // opinion is a reason to look, not "no objection raised").
     //
     // The fourth and fifth signals (fallbackTriggered, userFlagged) don't come from text
     // analysis but directly from the call site: fallbackTriggered from the tool loop in
@@ -99,6 +125,10 @@ public class LangChain4jController {
     private static final List<String> STATUS_KEYWORDS = List.of(
             "on its way", "delivered", "in_transit", "transit", "distribution center",
             "shipped", "delivery", "shipment", "tracking");
+
+    private static final int CONFIDENCE_REVIEW_THRESHOLD = 70;
+
+    private static final Pattern SCORE_PATTERN = Pattern.compile("\\d+");
 
     private final AnthropicChatModel chatModel;
     private final Tracer tracer;
@@ -168,7 +198,7 @@ public class LangChain4jController {
 
             if (response.finishReason() != FinishReason.TOOL_EXECUTION) {
                 String finalAnswer = response.aiMessage().text();
-                tagHumanOversightSignals(executedToolSequence, finalAnswer, false, flagForReview, userComment);
+                tagHumanOversightSignals(orderNumber, executedToolSequence, finalAnswer, false, flagForReview, userComment);
                 return finalAnswer;
             }
 
@@ -185,16 +215,14 @@ public class LangChain4jController {
         // too, not just the success case. fallbackTriggered=true is passed explicitly here rather
         // than derived from the tool sequence - at this point the loop knows for certain that
         // MAX_TOOL_STEPS was exceeded.
-        tagHumanOversightSignals(executedToolSequence, fallbackAnswer, true, flagForReview, userComment);
+        tagHumanOversightSignals(orderNumber, executedToolSequence, fallbackAnswer, true, flagForReview, userComment);
         return fallbackAnswer;
     }
 
     // -----------------------------------------------------------------------
-    // Human Oversight (Art. 14): five signals on the current span (Span.current() - here the
+    // Human Oversight (Art. 14): six signals on the current span (Span.current() - here the
     // HTTP root span from Spring's auto-instrumentation, the same implicit context propagation
-    // that executeLookupOrder/executeTrackingStatus rely on). All five are purely deterministic
-    // or passed directly by the caller - no second LLM call, no "judge", see the constants
-    // comment above for the rationale.
+    // that executeLookupOrder/executeTrackingStatus rely on).
     //
     // 1. tool_sequence_anomaly: expected-vs-actual comparison against CANONICAL_TOOL_SEQUENCE.
     // 2. uncertainty_detected: substring search for UNCERTAINTY_MARKERS in the answer.
@@ -203,13 +231,18 @@ public class LangChain4jController {
     // 4. fallback_triggered: passed in from orderStatus(), true when MAX_TOOL_STEPS was reached
     //    before the model produced a final answer.
     // 5. user_flagged: set by the end user themselves via the "flagForReview" request parameter -
-    //    independent of all four other signals.
+    //    independent of all five other signals.
+    // 6. judge_low_confidence / judge_failed: a second chatModel call (judgeConfidence()) scores
+    //    the final answer 0-100; below CONFIDENCE_REVIEW_THRESHOLD or unparseable/failed both
+    //    count as needing review. Skipped on the fallback path - see the CONFIDENCE_REVIEW_
+    //    THRESHOLD comment above the constants for why.
     //
-    // needsReview is the OR of all five - for Human Oversight, a false positive (reviewed
+    // needsReview is the OR of all six - for Human Oversight, a false positive (reviewed
     // unnecessarily) is the much smaller problem than a false negative (missed), see the
     // constants comment above.
     // -----------------------------------------------------------------------
     private void tagHumanOversightSignals(
+            String orderNumber,
             List<String> executedToolSequence,
             String finalAnswer,
             boolean fallbackTriggered,
@@ -232,16 +265,35 @@ public class LangChain4jController {
         span.setAttribute(AttributeKey.stringKey("human_oversight.user_comment"),
                 userComment == null ? "" : userComment);
 
+        // judge_confidence_score stays -1 ("no score recorded") both when the judge is skipped
+        // (fallback path) and when the judge call itself fails - see the CONFIDENCE_REVIEW_
+        // THRESHOLD comment above the constants for the fail-open/fail-closed reasoning.
+        boolean judgeFailed = false;
+        boolean lowConfidence = false;
+        int confidenceScore = -1;
+        if (!fallbackTriggered) {
+            try {
+                confidenceScore = judgeConfidence(orderNumber, finalAnswer);
+                lowConfidence = confidenceScore < CONFIDENCE_REVIEW_THRESHOLD;
+            } catch (Exception e) {
+                judgeFailed = true;
+            }
+        }
+        span.setAttribute(AttributeKey.longKey("human_oversight.judge_confidence_score"), confidenceScore);
+        span.setAttribute(AttributeKey.booleanKey("human_oversight.judge_low_confidence"), lowConfidence);
+        span.setAttribute(AttributeKey.booleanKey("human_oversight.judge_failed"), judgeFailed);
+
         boolean needsReview = sequenceAnomaly || uncertaintyDetected || statusKeywordMissing
-                || fallbackTriggered || userFlagged;
+                || fallbackTriggered || userFlagged || lowConfidence || judgeFailed;
         span.setAttribute(AttributeKey.booleanKey("human_oversight.needs_review"), needsReview);
 
         if (needsReview) {
             log.info(
                     "Trace flagged for human review (traceId={}, tool_sequence_anomaly={}, uncertainty_detected={}, " +
-                    "status_keyword_missing={}, fallback_triggered={}, user_flagged={})",
+                    "status_keyword_missing={}, fallback_triggered={}, user_flagged={}, judge_low_confidence={}, " +
+                    "judge_failed={})",
                     span.getSpanContext().getTraceId(), sequenceAnomaly, uncertaintyDetected,
-                    statusKeywordMissing, fallbackTriggered, userFlagged);
+                    statusKeywordMissing, fallbackTriggered, userFlagged, lowConfidence, judgeFailed);
         }
     }
 
@@ -250,6 +302,37 @@ public class LangChain4jController {
     private static boolean containsAny(String text, List<String> needles) {
         String lower = text.toLowerCase(Locale.ENGLISH);
         return needles.stream().anyMatch(lower::contains);
+    }
+
+    // Second model call, same chatModel, a different prompt: scores the first answer 0-100.
+    // Deliberately a plain text instruction ("reply with ONLY the number"), not a tool
+    // call/JSON schema - the goal here is the simplest possible version of an LLM-as-judge, not a
+    // production-grade one. A malformed or empty reply surfaces as judgeFailed (see
+    // parseScoreOrThrow) rather than silently defaulting to some score.
+    private int judgeConfidence(String orderNumber, String finalAnswer) {
+        ChatRequest judgeRequest = ChatRequest.builder()
+                .messages(List.of(
+                        SystemMessage.from(
+                                "Rate the quality of an automatically generated answer on a scale "
+                                + "from 0 (very uncertain/likely wrong) to 100 (very "
+                                + "confident/correct). Reply with ONLY the number."),
+                        UserMessage.from(
+                                "Order number: " + orderNumber + "\n"
+                                + "Generated answer: " + finalAnswer + "\n\n"
+                                + "How confident are you that this answer is correct and "
+                                + "complete? Reply with only the number 0-100.")))
+                .build();
+
+        String raw = chatModel.chat(judgeRequest).aiMessage().text();
+        return parseScoreOrThrow(raw);
+    }
+
+    private static int parseScoreOrThrow(String raw) {
+        Matcher matcher = SCORE_PATTERN.matcher(raw);
+        if (!matcher.find()) {
+            throw new IllegalStateException("Judge did not return a parseable number: " + raw);
+        }
+        return Math.max(0, Math.min(100, Integer.parseInt(matcher.group())));
     }
 
     private String executeTool(ToolExecutionRequest toolCall) {

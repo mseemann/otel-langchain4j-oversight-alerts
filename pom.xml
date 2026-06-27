@@ -14,7 +14,7 @@
     <artifactId>otel-langchain4j-oversight-alerts</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>otel-langchain4j-oversight-alerts</name>
-    <description>Five deterministic Human Oversight signals (Art. 14 EU AI Act) on top of an unguarded LangChain4j agentic loop - well observed, still fully exploitable</description>
+    <description>Six Human Oversight signals (Art. 14 EU AI Act, five deterministic plus a judge-model call) on top of an unguarded LangChain4j agentic loop - well observed, still fully exploitable</description>
 
     <properties>
         <java.version>21</java.version>

@@ -55,8 +55,8 @@ groups:
           description: |
             Traces with human_oversight.needs_review=true have been arriving continuously for at
             least 30 minutes (tool-sequence anomaly, uncertainty markers or missing status words
-            in the answer, fallback after too many tool calls, or flagged by the end user
-            themselves - all deterministic, no LLM judge). This is NOT proof of a growing backlog
-            depth (see comment above) - but a sign that someone should look at the queue:
-            review-queue/review-queue.jsonl, then submit traceId/spanId from there to
-            POST /lc4j/human-intervention.
+            in the answer, fallback after too many tool calls, flagged by the end user themselves,
+            or scored low-confidence/failed by the judge model - five deterministic checks plus
+            one model-based one). This is NOT proof of a growing backlog depth (see comment above)
+            - but a sign that someone should look at the queue: review-queue/review-queue.jsonl,
+            then submit traceId/spanId from there to POST /lc4j/human-intervention.

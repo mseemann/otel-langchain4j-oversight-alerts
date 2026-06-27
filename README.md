@@ -1,10 +1,10 @@
-# Five Signals, No Guardrail
+# Six Signals, No Guardrail
 
 *(Working title — companion article in the "AI Observability & Compliance for Enterprise Java" series, not yet published. Link added here once it's live.)*
 
-Companion repo for the article that asks what Human Oversight (Art. 14 EU AI Act) looks like when it's added as pure *observability* — five deterministic signals layered on top of an agentic tool chain — with no guardrail anywhere near the customer-facing answer.
+Companion repo for the article that asks what Human Oversight (Art. 14 EU AI Act) looks like when it's added as pure *observability* — six signals layered on top of an agentic tool chain — with no guardrail anywhere near the customer-facing answer.
 
-Builds on [otel-langchain4j-toolchain-costs](https://github.com/mseemann/otel-langchain4j-toolchain-costs): same `/order-status` endpoint, same two-tool chain (`lookup_order` → `get_tracking_status`, the second fed by the first's output). What's new here is `tagHumanOversightSignals()` — five span attributes that tell a reviewer *whether* something looks wrong with a given trace: an unexpected tool order, hedging language in the answer, missing delivery-status vocabulary, a fallback after too many tool calls, or the customer flagging their own request. All five are plain deterministic checks — fixed word lists, a fixed expected sequence — no second LLM call scoring the first one.
+Builds on [otel-langchain4j-toolchain-costs](https://github.com/mseemann/otel-langchain4j-toolchain-costs): same `/order-status` endpoint, same two-tool chain (`lookup_order` → `get_tracking_status`, the second fed by the first's output). What's new here is `tagHumanOversightSignals()` — six span attributes that tell a reviewer *whether* something looks wrong with a given trace: an unexpected tool order, hedging language in the answer, missing delivery-status vocabulary, a fallback after too many tool calls, the customer flagging their own request, or a second model call scoring the first answer's confidence. Five of the six are plain deterministic checks — fixed word lists, a fixed expected sequence, no model call involved. The sixth, `judgeConfidence()`, is exactly the thing the other five avoid: a second LLM call judging the first one's answer. It's included anyway, as an additional signal running in parallel to the deterministic ones, not a replacement for them — see the article for why both are worth having side by side.
 
 What none of that changes: the success-path answer returned to the customer is `response.aiMessage().text()` — the model's free text, verbatim, unfiltered. There is no Java template standing between the model and the customer, no output guard, no input sanitization on a customer note. The signals make a bad answer *visible after the fact*. They do nothing to stop it from reaching the customer first. That gap — and what it would take to close it — is the next repo in this series, [otel-langchain4j-human-oversight](https://github.com/mseemann/otel-langchain4j-human-oversight), which replaces this exact endpoint with a forced three-way router.
 
@@ -13,7 +13,7 @@ What none of that changes: the success-path answer returned to the customer is `
 - Java 21
 - Maven
 - Docker + Docker Compose
-- An [Anthropic API key](https://console.anthropic.com/) — the demo calls the real Claude Haiku model, cost per test run is a few cents
+- An [Anthropic API key](https://console.anthropic.com/) — the demo calls the real Claude Haiku model, twice per successful request now (the answer, then the judge scoring it); cost per test run is still a few cents
 
 ## Getting started
 
@@ -43,7 +43,7 @@ curl "http://localhost:8080/lc4j/order-status?orderNumber=ORD-4711&flagForReview
   --data-urlencode "userComment=This is definitely the wrong delivery address" -G
 ```
 
-The other four signals — `tool_sequence_anomaly`, `uncertainty_detected`, `status_keyword_missing`, `fallback_triggered` — aren't reachable through a request parameter. They depend on what the model actually does and writes, which is exactly the point of this repo: nothing here constrains the model's behavior, so nothing here can *guarantee* triggering them either. Calling the endpoint repeatedly with unusual `orderNumber` values (e.g. a non-numeric one) and watching the traces in Jaeger is the honest way to explore them — some calls will look completely unremarkable, some won't.
+The other five signals — `tool_sequence_anomaly`, `uncertainty_detected`, `status_keyword_missing`, `fallback_triggered`, `judge_low_confidence`/`judge_failed` — aren't reachable through a request parameter. They depend on what the model actually does and writes (and, for the judge, on what a second model call makes of it), which is exactly the point of this repo: nothing here constrains the model's behavior, so nothing here can *guarantee* triggering them either. Calling the endpoint repeatedly with unusual `orderNumber` values (e.g. a non-numeric one) and watching the traces in Jaeger is the honest way to explore them — some calls will look completely unremarkable, some won't.
 
 ### 4. Prove the pipeline and alerts fire, without depending on the model
 
@@ -73,7 +73,7 @@ curl -X POST http://localhost:8080/lc4j/human-intervention \
 
 ## What you'll see in Jaeger
 
-Each call to `/order-status` produces a `chat` span per planning/final step plus one `execute_tool` span per tool call (`lookup_order`, `get_tracking_status`) — anywhere from three spans (clean run) up to the `MAX_TOOL_STEPS` ceiling if the model loops. The root span carries the full `human_oversight.*` attribute set: `tool_sequence_actual`, `tool_sequence_anomaly`, `uncertainty_detected`, `status_keyword_missing`, `fallback_triggered`, `user_flagged`, `user_comment`, `needs_review`.
+Each call to `/order-status` produces a `chat` span per planning/final step plus one `execute_tool` span per tool call (`lookup_order`, `get_tracking_status`) — anywhere from three spans (clean run) up to the `MAX_TOOL_STEPS` ceiling if the model loops, plus one more `chat` span for the judge call on the success path. The root span carries the full `human_oversight.*` attribute set: `tool_sequence_actual`, `tool_sequence_anomaly`, `uncertainty_detected`, `status_keyword_missing`, `fallback_triggered`, `user_flagged`, `user_comment`, `judge_confidence_score`, `judge_low_confidence`, `judge_failed`, `needs_review`.
 
 A `human_intervention` span recorded via step 5 attaches to the *same* trace it reviews — same trace ID, no separate audit log to cross-reference.
 
@@ -101,7 +101,7 @@ Alertmanager routes `domain: human-oversight` into a faster-grouped sub-route (`
 
 ## More context
 
-The background on why LangChain4j needs manual instrumentation on Spring Boot at all is covered in [otel-langchain4j-springboot](https://github.com/mseemann/otel-langchain4j-springboot) and its article. This repo's own article covers what five well-designed, fully deterministic observability signals can and cannot do for Art. 14 compliance when the thing they're observing — a free-text answer formulated by the model — is itself never constrained.
+The background on why LangChain4j needs manual instrumentation on Spring Boot at all is covered in [otel-langchain4j-springboot](https://github.com/mseemann/otel-langchain4j-springboot) and its article. This repo's own article covers what six observability signals — five deterministic, one a second model call judging the first — can and cannot do for Art. 14 compliance when the thing they're observing — a free-text answer formulated by the model — is itself never constrained.
 
 ## License
 

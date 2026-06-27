@@ -25,11 +25,12 @@
 #   normal "traces" pipeline, which has no tail-sampling in THIS repo
 #   (unlike the source learning project this is extracted from) - so
 #   that part isn't actually at risk here. What IS still probabilistic is
-#   the live model call itself (step 3 in the README): this script
-#   doesn't touch that path at all, on purpose - it only proves the
-#   deterministic parts of the system (pipeline + controller) work,
-#   independent of whatever a live Anthropic call happens to produce on
-#   a given run.
+#   the live model call itself (step 3 in the README) - including the
+#   judge call (judgeConfidence()), which is just a second instance of
+#   exactly that same probabilistic call: this script doesn't touch that
+#   path at all, on purpose - it only proves the deterministic parts of
+#   the system (pipeline + controller) work, independent of whatever a
+#   live Anthropic call happens to produce on a given run.
 #
 # Requirements:
 #   - docker compose up -d (Collector + Jaeger; review-queue/ must be
