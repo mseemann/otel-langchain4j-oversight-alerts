@@ -23,26 +23,12 @@ import java.util.HexFormat;
 import java.util.Set;
 
 /**
- * Human Oversight (Art. 14 EU AI Act).
+ * Human Oversight (Art. 14 EU AI Act): records a reviewer's decision as a span in the SAME
+ * trace it reviews, via SpanContext.createFromRemoteParent(...) - so Jaeger correlates the
+ * intervention with the original decision via trace ID, no separate audit log needed. See the
+ * README for the full rationale.
  *
- * The human intervention is recorded as a span in the SAME trace it reviews - not in a separate
- * audit log. Reasoning: Art. 14 requires interventions to be traceably linked to the AI decision
- * they relate to. A span in the same trace establishes that link directly via the trace ID,
- * without needing to introduce a second correlation scheme (e.g. a "ticket_id <-> trace_id"
- * mapping table).
- *
- * On how this works: SpanContext.createFromRemoteParent(...) treats the traceId/spanId supplied
- * by the reviewer exactly the way OTel treats them for any incoming distributed request (W3C
- * Trace Context propagation) - even though there's no distributed call here, just a
- * late-arriving HTTP request from a human. Semantically this fits exactly: "externally supplied
- * trace context that a new span gets attached to". Tracing backends (Jaeger etc.) correlate by
- * trace ID at query time, not against some hard trace-completion deadline - so this works even
- * for a trace that was exported hours earlier.
- *
- * Data minimization: the reviewer name is SHA-256 hashed before being written into a span
- * attribute - same reasoning as elsewhere in this series (a compliance log should contain as
- * little directly identifying personal data as possible, even if it's itself protected against
- * deletion).
+ * The reviewer name is SHA-256 hashed before being stored (data minimization).
  */
 @RestController
 @RequestMapping("/lc4j")
@@ -116,9 +102,7 @@ public class HumanOversightController {
                 .setParent(context)
                 .setAttribute(AttributeKey.stringKey("human_oversight.reviewer_hash"), reviewerHash)
                 .setAttribute(AttributeKey.stringKey("human_oversight.decision"), body.decision())
-                // human_oversight.comment goes through the same transform/mask-pii pipeline as
-                // every other span (see otel-collector-config.yml) - reviewers should still avoid
-                // plain-text personal data in free text.
+                // Goes through the same mask-pii pipeline as every span (otel-collector-config.yml).
                 .setAttribute(AttributeKey.stringKey("human_oversight.comment"),
                         body.comment() == null ? "" : body.comment())
                 .startSpan();
@@ -139,9 +123,8 @@ public class HumanOversightController {
             byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
             return HexFormat.of().formatHex(hash);
         } catch (NoSuchAlgorithmException e) {
-            // SHA-256 is available on every standard JVM - practically unreachable. But without
-            // the hash, the plain-text reviewer name must never be written to a span attribute
-            // (data minimization, see class comment above).
+            // Practically unreachable (SHA-256 is on every standard JVM); fail loud rather than
+            // ever writing the plain-text reviewer name to a span attribute.
             throw new IllegalStateException("SHA-256 not available", e);
         }
     }
